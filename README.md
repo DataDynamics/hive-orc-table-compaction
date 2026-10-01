@@ -29,8 +29,10 @@ Before
 
 After
 
-6 ~ 20 Large ORC Files
+5 ~ 10 Large ORC Files
 ```
+
+(평균 약 2.4 MB × 1,000개 ≈ 2.4 GB를 256 MB ~ 512 MB 크기로 재구성하는 경우)
 
 목표는 단순히 파일을 하나로 합치는 것이 아니라 적절한 크기의 ORC 파일로 재구성하는 것입니다.
 
@@ -44,7 +46,7 @@ Target ORC File Size
 
 ---
 
-# 2. 전체 처리 구조
+## 2. 전체 처리 구조
 
 ```mermaid
 flowchart TD
@@ -89,7 +91,7 @@ flowchart TD
 
 ---
 
-# 3. 처리 전 데이터 구조
+## 3. 처리 전 데이터 구조
 
 예를 들어 Hive 테이블이 다음과 같다고 가정합니다.
 
@@ -113,13 +115,15 @@ HDFS에는 다음처럼 저장되어 있을 수 있습니다.
 ├── dt=2026-09-29
 ├── dt=2026-09-30
 └── dt=2026-10-01
-      ├── 000000_0.orc
-      ├── 000001_0.orc
-      ├── 000002_0.orc
-      ├── 000003_0.orc
+      ├── 000000_0
+      ├── 000001_0
+      ├── 000002_0
+      ├── 000003_0
       ├── ...
-      └── 000999_0.orc
+      └── 000999_0
 ```
+
+Hive가 생성한 ORC 파일은 보통 `000000_0`처럼 확장자 없이 저장됩니다. Spark로 Compaction한 이후에는 `part-00000-<uuid>-c000.snappy.orc` 형태의 파일 이름으로 바뀝니다.
 
 이를 Mermaid로 표현하면 다음과 같습니다.
 
@@ -141,7 +145,7 @@ flowchart LR
 
 ---
 
-# 4. Merge 이후
+## 4. Merge 이후
 
 예를 들어 파티션 전체 데이터 크기가 5GB이고 목표 파일 크기를 512MB로 설정한다면:
 
@@ -174,7 +178,7 @@ flowchart LR
 
 ---
 
-# 5. 원본에 바로 Overwrite하면 안 되는 이유
+## 5. 원본에 바로 Overwrite하면 안 되는 이유
 
 다음 구조는 피하는 것이 좋습니다.
 
@@ -187,6 +191,12 @@ flowchart TD
 ```
 
 Spark가 읽고 있는 디렉터리를 동시에 삭제하거나 Overwrite할 수 있기 때문입니다.
+
+실제로 Spark는 이런 경우 대부분 다음 에러로 실행을 막습니다.
+
+```text
+Cannot overwrite a path that is also being read from.
+```
 
 따라서 Staging Area를 사용합니다.
 
@@ -208,7 +218,7 @@ flowchart LR
 
 ---
 
-# 6. 파일 개수 자동 계산
+## 6. 파일 개수 자동 계산
 
 운영 환경에서는 다음처럼 고정하는 것보다:
 
@@ -256,7 +266,7 @@ Target Files = 20
 
 ---
 
-# 7. Compaction 판단
+## 7. Compaction 판단
 
 다음과 같은 정책을 사용할 수 있습니다.
 
@@ -265,7 +275,7 @@ flowchart TD
 
     A["Partition 확인"] --> B["파일 수 확인"]
 
-    B --> C{"파일 수 > 100?"}
+    B --> C{"파일 수 >= 100?"}
 
     C -->|"No"| D["Skip"]
 
@@ -310,15 +320,16 @@ Target Files
 
 ---
 
-# 8. PySpark 전체 프로그램
+## 8. PySpark 전체 프로그램
 
 다음 코드는 다음 기능을 포함합니다.
 
+* 전체 Partition Column 지정 여부 검증
 * Hive Partition 위치 자동 조회
 * HDFS Partition 용량 확인
 * HDFS 파일 수 확인
 * 목표 ORC 파일 수 자동 계산
-* Small File 기준 이하이면 Skip
+* 파일 수가 최소 기준 미만이면 Skip
 * `coalesce()` 또는 `repartition()` 지원
 * Staging ORC 생성
 * Source/Staging Row Count 검증
@@ -339,7 +350,6 @@ hive_orc_compaction.py
 
 import argparse
 import math
-import re
 import uuid
 from datetime import datetime
 
@@ -456,41 +466,29 @@ def validate_table(table_name):
 
     1. Hive ACID
     2. Hive Bucketed Table
+
+    Spark 3.x의 SHOW CREATE TABLE은 Hive DDL이 아닌
+    Spark DDL을 출력하고, Transactional Table에서는
+    예외를 발생시키므로 Metastore 정보를 직접 조회한다.
     """
-
-    rows = spark.sql(
-        f"SHOW CREATE TABLE {table_name}"
-    ).collect()
-
-    ddl = "\n".join(
-        str(row[0])
-        for row in rows
-    )
 
     print()
     print("========================================")
     print("Table Validation")
     print("========================================")
 
-    # Bucket Table 확인
-
-    if re.search(
-        r"\bCLUSTERED\s+BY\b",
-        ddl,
-        re.IGNORECASE
-    ):
-        raise RuntimeError(
-            "Hive Bucketed Table입니다. "
-            "CLUSTERED BY 테이블에는 "
-            "이 Compaction 프로그램을 사용하지 마십시오."
-        )
-
     # Hive ACID 확인
 
-    if re.search(
-        r"""['"]transactional['"]\s*=\s*['"]true['"]""",
-        ddl,
-        re.IGNORECASE
+    properties = {
+        str(row[0]).strip(): str(row[1]).strip()
+        for row in spark.sql(
+            f"SHOW TBLPROPERTIES {table_name}"
+        ).collect()
+    }
+
+    if (
+        properties.get("transactional", "")
+        .lower() == "true"
     ):
         raise RuntimeError(
             "Hive ACID Transactional Table입니다. "
@@ -498,7 +496,70 @@ def validate_table(table_name):
             "사용하는 것을 권장합니다."
         )
 
+    # Bucket Table 확인
+
+    rows = spark.sql(
+        f"DESCRIBE FORMATTED {table_name}"
+    ).collect()
+
+    for row in rows:
+
+        key = (
+            str(row[0]).strip()
+            if row[0] is not None
+            else ""
+        )
+
+        if key == "Num Buckets":
+
+            value = str(row[1]).strip()
+
+            if value.lstrip("-").isdigit() and int(value) > 0:
+                raise RuntimeError(
+                    "Hive Bucketed Table입니다. "
+                    "CLUSTERED BY 테이블에는 "
+                    "이 Compaction 프로그램을 사용하지 마십시오."
+                )
+
     print("Table validation OK")
+
+
+def validate_partition_spec(
+    table_name,
+    partition_spec
+):
+    """
+    테이블의 모든 Partition Column이 지정되었는지 확인한다.
+
+    예: year/month/day 테이블에 --partition year=2026만
+    지정하면 나머지 Partition Column이 data column으로
+    처리되므로 실행을 중단한다.
+    """
+
+    partition_columns = [
+        column.name
+        for column in spark.catalog.listColumns(
+            table_name
+        )
+        if column.isPartition
+    ]
+
+    if not partition_columns:
+        raise RuntimeError(
+            f"Partition Table이 아닙니다: {table_name}"
+        )
+
+    if (
+        {c.lower() for c in partition_columns}
+        != {c.lower() for c in partition_spec}
+    ):
+        raise ValueError(
+            "모든 Partition Column을 지정해야 합니다. "
+            f"테이블 Partition Column: {partition_columns}, "
+            f"입력값: {list(partition_spec.keys())}"
+        )
+
+    return partition_columns
 
 
 # ============================================================
@@ -711,6 +772,11 @@ def compact_partition(
         table_name
     )
 
+    partition_columns = validate_partition_spec(
+        table_name,
+        partition_spec
+    )
+
     # --------------------------------------------------------
     # 2. Partition Location 조회
     # --------------------------------------------------------
@@ -770,7 +836,12 @@ def compact_partition(
     # 5. Target File 개수 계산
     # --------------------------------------------------------
 
-    if target_files_override:
+    if target_files_override is not None:
+
+        if target_files_override < 1:
+            raise ValueError(
+                "--target-files는 1 이상이어야 합니다."
+            )
 
         target_files = (
             target_files_override
@@ -821,16 +892,15 @@ def compact_partition(
         table_df.columns
     )
 
-    partition_columns = (
-        list(
-            partition_spec.keys()
-        )
-    )
+    partition_column_names = {
+        column.lower()
+        for column in partition_columns
+    }
 
     data_columns = [
         column
         for column in all_columns
-        if column not in partition_columns
+        if column.lower() not in partition_column_names
     ]
 
     # --------------------------------------------------------
@@ -1002,8 +1072,20 @@ def compact_partition(
         uuid.uuid4().hex
     )
 
-    staged_df.createOrReplaceTempView(
-        temp_view
+    # Staging을 다시 읽으면 Spark가 큰 ORC 파일을
+    # spark.sql.files.maxPartitionBytes(기본 128MB) 단위로
+    # 나누어 읽으므로, 그대로 INSERT하면 파일 수가
+    # Target Files보다 몇 배 많아진다.
+    # 다시 coalesce하여 최종 파일 수를 Target Files로 맞춘다.
+
+    (
+        staged_df
+        .coalesce(
+            target_files
+        )
+        .createOrReplaceTempView(
+            temp_view
+        )
     )
 
     # --------------------------------------------------------
@@ -1281,7 +1363,7 @@ if __name__ == "__main__":
 
 ---
 
-# 9. PySpark 프로그램 실행
+## 9. PySpark 프로그램 실행
 
 파일을 다음 이름으로 저장합니다.
 
@@ -1293,6 +1375,17 @@ hive_orc_compaction.py
 
 ```bash
 spark-submit \
+  hive_orc_compaction.py \
+  --table dw.sales \
+  --partition dt=2026-10-01
+```
+
+운영 환경(YARN)에서는 보통 다음처럼 실행합니다.
+
+```bash
+spark-submit \
+  --master yarn \
+  --deploy-mode cluster \
   hive_orc_compaction.py \
   --table dw.sales \
   --partition dt=2026-10-01
@@ -1318,7 +1411,7 @@ coalesce
 
 ---
 
-# 10. Target File Size 변경
+## 10. Target File Size 변경
 
 256MB를 목표로 하고 싶다면:
 
@@ -1332,7 +1425,7 @@ spark-submit \
 
 ---
 
-# 11. 파일 개수를 직접 지정
+## 11. 파일 개수를 직접 지정
 
 자동 계산하지 않고 무조건 약 8개로 만들고 싶다면:
 
@@ -1352,9 +1445,11 @@ Target File Size
 
 계산보다 `--target-files` 설정이 우선합니다.
 
+`--target-files`는 1 이상의 정수여야 합니다.
+
 ---
 
-# 12. 복수 Partition Column
+## 12. 복수 Partition Column
 
 테이블이:
 
@@ -1387,7 +1482,7 @@ year=2026/month=10/day=01
 
 ---
 
-# 13. coalesce와 repartition
+## 13. coalesce와 repartition
 
 기본값은:
 
@@ -1441,7 +1536,7 @@ spark-submit \
 
 ---
 
-# 14. 실제 처리 예
+## 14. 실제 처리 예
 
 처리 전:
 
@@ -1497,12 +1592,14 @@ flowchart LR
 
     C --> D["INSERT OVERWRITE"]
 
-    D --> E["After<br/>약 20 files<br/>9.7GB"]
+    D --> E["After<br/>약 20 files<br/>약 9.7GB"]
 ```
+
+ORC 파일을 다시 쓰면 Stripe 구성과 압축률이 달라지므로 Compaction 이후 전체 용량은 원본과 약간 다를 수 있습니다.
 
 ---
 
-# 15. 운영 시점
+## 15. 운영 시점
 
 현재 데이터가 계속 들어오고 있는 Partition은 Compaction하면 안 됩니다.
 
@@ -1544,9 +1641,11 @@ D-1
 
 이전의 **적재가 완전히 종료된 Partition만** 처리합니다.
 
+또한 `INSERT OVERWRITE`는 원자적(Atomic)으로 동작하지 않습니다. 실행 중에 다른 사용자가 해당 Partition을 조회하면 비어 있거나 일부만 존재하는 데이터를 볼 수 있으므로, 조회가 적은 시간대에 실행하는 것이 좋습니다.
+
 ---
 
-# 16. Hive Bucket Table 주의
+## 16. Hive Bucket Table 주의
 
 다음과 같은 테이블:
 
@@ -1573,11 +1672,13 @@ flowchart TD
     D --> F["Spark Compaction 가능"]
 ```
 
-작성한 PySpark 프로그램은 `SHOW CREATE TABLE`을 검사하여 `CLUSTERED BY`가 발견되면 실행을 중단하도록 했습니다.
+작성한 PySpark 프로그램은 `DESCRIBE FORMATTED`의 `Num Buckets` 값을 검사하여 Bucket Table이면 실행을 중단하도록 했습니다.
+
+`SHOW CREATE TABLE`은 Spark 3.x부터 Hive DDL이 아닌 Spark DDL을 출력하므로 검사 용도로 사용하지 않습니다.
 
 ---
 
-# 17. Hive ACID Table 주의
+## 17. Hive ACID Table 주의
 
 다음 속성이 있다면:
 
@@ -1594,6 +1695,10 @@ ALTER TABLE dw.sales
 PARTITION (dt='2026-10-01')
 COMPACT 'MAJOR';
 ```
+
+작성한 PySpark 프로그램은 `SHOW TBLPROPERTIES`로 `transactional` 속성을 확인하여 ACID Table이면 실행을 중단합니다.
+
+HDP 3.x / CDP처럼 Managed Table이 기본적으로 ACID로 생성되는 환경에서는 Spark가 Hive Warehouse Connector 없이 해당 테이블을 읽지 못할 수도 있습니다.
 
 구조적으로:
 
@@ -1613,7 +1718,40 @@ flowchart TD
 
 ---
 
-# 18. 운영 자동화 구조
+## 18. 실패 시 복구
+
+Staging Row Count 검증에서 실패하면 원본 Partition은 변경되지 않습니다.
+
+반면 `INSERT OVERWRITE` 이후 최종 Row Count 검증에서 실패하면 원본 파일은 이미 교체된 상태입니다. 이 경우 예외가 발생하여 Staging Directory가 삭제되지 않고 남아 있으므로, Staging 데이터로 Partition을 다시 복구할 수 있습니다.
+
+```python
+staged_df = spark.read.format("orc").load(
+    "hdfs:///tmp/hive_orc_compaction/dw_sales/<run_id>"
+)
+
+staged_df.createOrReplaceTempView("compact_recovery")
+
+spark.sql("""
+    INSERT OVERWRITE TABLE dw.sales
+    PARTITION (dt='2026-10-01')
+    SELECT id, customer_id, amount
+    FROM compact_recovery
+""")
+```
+
+Staging 경로는 프로그램 실행 로그의 `Staging Path` 항목에서 확인할 수 있습니다.
+
+Compaction이 완료된 이후 Hive Metastore 통계를 최신으로 유지하려면 다음을 실행할 수 있습니다.
+
+```sql
+ANALYZE TABLE dw.sales
+PARTITION (dt='2026-10-01')
+COMPUTE STATISTICS;
+```
+
+---
+
+## 19. 운영 자동화 구조
 
 최종적으로는 다음 형태로 운영하는 것을 권장합니다.
 
@@ -1628,7 +1766,7 @@ flowchart TD
 
     D --> E["HDFS File Count 확인"]
 
-    E --> F{"Files > 100?"}
+    E --> F{"Files >= 100?"}
 
     F -->|"No"| G["Skip"]
 
@@ -1664,7 +1802,7 @@ flowchart TD
 
 ---
 
-# 19. 권장 운영 값
+## 20. 권장 운영 값
 
 초기 운영값으로 다음 정도를 권장합니다.
 
@@ -1685,7 +1823,7 @@ flowchart TD
 
 ---
 
-# 20. 가장 중요한 처리 흐름
+## 21. 가장 중요한 처리 흐름
 
 운영 관점에서 핵심만 정리하면 다음과 같습니다.
 
